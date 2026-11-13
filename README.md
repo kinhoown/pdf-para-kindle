@@ -23,6 +23,9 @@ App Android que transforma um PDF em livro do Kindle (EPUB), coloca a capa e env
 O app detecta a capa, gera o livro e envia sozinho. Em alguns minutos ele aparece no Kindle com a capa.
 Se a capa escolhida estiver errada, toque em **Capa errada? Escolher outra e reenviar**.
 
+Às vezes a Amazon manda um e-mail pedindo para **confirmar o envio**. O app fica olhando o seu Gmail
+(com a mesma senha de app, só leitura) e, quando esse e-mail chega, mostra o botão **Confirmar na Amazon**.
+
 Depois do envio, o app pergunta se você quer **apagar o PDF do celular**. Se o PDF veio compartilhado por outro app,
 o Android pede um toque a mais: escolher o PDF de novo para confirmar.
 

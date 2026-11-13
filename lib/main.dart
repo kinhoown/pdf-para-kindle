@@ -5,10 +5,12 @@ import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
 import 'package:pdfrx/pdfrx.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'converter/pdf_analyzer.dart';
 import 'converter/pdf_to_epub.dart';
 import 'screens/settings_screen.dart';
+import 'services/amazon_verify_watcher.dart';
 import 'services/kindle_sender.dart';
 import 'services/settings.dart';
 
@@ -36,6 +38,8 @@ class PdfKindleApp extends StatelessWidget {
 
 enum Stage { idle, working, done, error }
 
+enum VerifyState { none, waiting, found, notFound }
+
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
 
@@ -53,6 +57,9 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _pdfPath;
   String? _pdfUri; // arquivo original (para poder apagar)
   int? _coverPage;
+  VerifyState _verify = VerifyState.none;
+  AmazonVerification? _verification;
+  int _watchId = 0; // muda a cada envio: cancela a vigia anterior
   static const _share = MethodChannel('pdf_kindle/share');
 
   @override
@@ -109,7 +116,10 @@ class _HomeScreenState extends State<HomeScreen> {
       await _openSettings(firstRun: true);
       if (!(_settings?.isComplete ?? false)) return;
     }
+    _watchId++;
     setState(() {
+      _verify = VerifyState.none;
+      _verification = null;
       _stage = Stage.working;
       _progress = 0;
       _message = 'Abrindo o PDF…';
@@ -138,7 +148,9 @@ class _HomeScreenState extends State<HomeScreen> {
       final epub = File('${tmp.path}/livro.epub');
       await epub.writeAsBytes(r.epub);
       // FAKE_SEND só existe em builds de teste (flutter build apk --dart-define=FAKE_SEND=true)
+      final sentAt = DateTime.now();
       if (!const bool.fromEnvironment('FAKE_SEND')) await KindleSender(_settings!).sendEpub(epub, title);
+      _watchVerification(sentAt);
       setState(() {
         _stage = Stage.done;
         _progress = 1;
@@ -152,6 +164,73 @@ class _HomeScreenState extends State<HomeScreen> {
         _stage = Stage.error;
         _message = e.toString().replaceFirst('Exception: ', '');
       });
+    }
+  }
+
+  /// Fica olhando o e-mail até a Amazon mandar o pedido de confirmação.
+  Future<void> _watchVerification(DateTime sentAt) async {
+    final id = _watchId;
+    setState(() => _verify = VerifyState.waiting);
+    AmazonVerification? found;
+    const fake = String.fromEnvironment('FAKE_VERIFY_URL'); // só para testes no emulador
+    if (fake.isNotEmpty) {
+      await Future<void>.delayed(const Duration(seconds: 4));
+      found = AmazonVerification(url: fake, subject: 'teste');
+    } else {
+      found = await AmazonVerifyWatcher(_settings!).waitFor(sentAt: sentAt, isCancelled: () => id != _watchId || !mounted);
+    }
+    if (!mounted || id != _watchId) return;
+    setState(() {
+      _verification = found;
+      _verify = found == null ? VerifyState.notFound : VerifyState.found;
+    });
+  }
+
+  Future<void> _openVerification() async {
+    final url = _verification?.url ?? 'https://mail.google.com/';
+    final ok = await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+    if (!ok && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Não consegui abrir o link. Abra o e-mail da Amazon.')));
+    }
+  }
+
+  Widget _verifyBox(ColorScheme cs) {
+    switch (_verify) {
+      case VerifyState.none:
+        return const SizedBox.shrink();
+      case VerifyState.waiting:
+        return Padding(
+          padding: const EdgeInsets.only(top: 10),
+          child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+            const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),
+            const SizedBox(width: 10),
+            Flexible(child: Text('Olhando seu e-mail caso a Amazon peça confirmação…', style: TextStyle(color: cs.onSurfaceVariant))),
+          ]),
+        );
+      case VerifyState.notFound:
+        return Padding(
+          padding: const EdgeInsets.only(top: 10),
+          child: Text('Nenhum pedido de confirmação da Amazon até agora.',
+              textAlign: TextAlign.center, style: TextStyle(color: cs.onSurfaceVariant)),
+        );
+      case VerifyState.found:
+        return Card(
+          margin: const EdgeInsets.only(top: 12),
+          color: cs.tertiaryContainer,
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(children: [
+              Text('A Amazon pediu para você confirmar o envio.',
+                  textAlign: TextAlign.center, style: TextStyle(color: cs.onTertiaryContainer, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 10),
+              FilledButton.icon(
+                onPressed: _openVerification,
+                icon: const Icon(Icons.verified_user),
+                label: Text(_verification?.url != null ? 'Confirmar na Amazon' : 'Abrir o e-mail da Amazon'),
+              ),
+            ]),
+          ),
+        );
     }
   }
 
@@ -258,6 +337,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   const SizedBox(width: 8),
                   Flexible(child: Text(_message)),
                 ]),
+              if (_stage == Stage.done) _verifyBox(cs),
               if (_stage == Stage.error)
                 Row(mainAxisAlignment: MainAxisAlignment.center, children: [
                   Icon(Icons.error, color: cs.error),
