@@ -1,6 +1,5 @@
-﻿import 'dart:io';
+import 'dart:io';
 
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
@@ -52,6 +51,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Uint8List? _cover;
   String? _title;
   String? _pdfPath;
+  String? _pdfUri; // arquivo original (para poder apagar)
   int? _coverPage;
   static const _share = MethodChannel('pdf_kindle/share');
 
@@ -68,7 +68,7 @@ class _HomeScreenState extends State<HomeScreen> {
       await WidgetsBinding.instance.endOfFrame;
       if (mounted) await _openSettings(firstRun: true);
     }
-    // PDF compartilhado/aberto a partir de outro app (WhatsApp, Drive, Arquivosâ€¦)
+    // PDF compartilhado/aberto a partir de outro app (WhatsApp, Drive, Arquivos…)
     _share.setMethodCallHandler((call) async {
       if (call.method == 'pdfShared') _onShared(call.arguments);
     });
@@ -79,7 +79,7 @@ class _HomeScreenState extends State<HomeScreen> {
     if (info is! Map) return;
     final path = info['path'] as String?;
     if (path == null) return;
-    _start(path, _nameFromPath(info['name'] as String? ?? path));
+    _start(path, _nameFromPath(info['name'] as String? ?? path), originalUri: info['uri'] as String?);
   }
 
   String _nameFromPath(String path) {
@@ -98,23 +98,11 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _pick() async {
-    final f = await FilePicker.pickFile(type: FileType.custom, allowedExtensions: ['pdf']);
-    if (f == null) return;
-    String path;
-    if (f.path != null) {
-      path = f.path!;
-    } else {
-      final tmp = await getTemporaryDirectory();
-      final out = File('${tmp.path}/entrada.pdf');
-      final sink = out.openWrite();
-      await sink.addStream(f.readAsByteStream());
-      await sink.close();
-      path = out.path;
-    }
-    await _start(path, _nameFromPath(f.name));
+    // seletor nativo do Android: devolve uma cópia + o endereço do arquivo original
+    _onShared(await _share.invokeMethod('pickPdf'));
   }
 
-  Future<void> _start(String path, String title, {int? forcedCoverPage}) async {
+  Future<void> _start(String path, String title, {int? forcedCoverPage, String? originalUri}) async {
     if (_stage == Stage.working) return;
     final s = _settings;
     if (s == null || !s.isComplete) {
@@ -124,10 +112,11 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       _stage = Stage.working;
       _progress = 0;
-      _message = 'Abrindo o PDFâ€¦';
+      _message = 'Abrindo o PDF…';
       _title = title;
       _pdfPath = path;
       if (forcedCoverPage == null) _cover = null;
+      if (originalUri != null) _pdfUri = originalUri;
     });
     try {
       final conv = PdfToEpubConverter(onProgress: (m, p) {
@@ -142,26 +131,75 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() {
         _cover = r.coverJpeg;
         _coverPage = r.coverPage;
-        _message = 'Enviando para o Kindleâ€¦';
+        _message = 'Enviando para o Kindle…';
         _progress = 0.9;
       });
       final tmp = await getTemporaryDirectory();
       final epub = File('${tmp.path}/livro.epub');
       await epub.writeAsBytes(r.epub);
-      await KindleSender(_settings!).sendEpub(epub, title);
+      // FAKE_SEND só existe em builds de teste (flutter build apk --dart-define=FAKE_SEND=true)
+      if (!const bool.fromEnvironment('FAKE_SEND')) await KindleSender(_settings!).sendEpub(epub, title);
       setState(() {
         _stage = Stage.done;
         _progress = 1;
         _message = r.imageMode
-            ? 'Enviado! (PDF escaneado: as pÃ¡ginas foram como imagem.)'
+            ? 'Enviado! (PDF escaneado: as páginas foram como imagem.)'
             : 'Enviado! Chega no Kindle em alguns minutos.';
       });
+      await _askDeletePdf();
     } catch (e) {
       setState(() {
         _stage = Stage.error;
         _message = e.toString().replaceFirst('Exception: ', '');
       });
     }
+  }
+
+  /// Depois do envio, pergunta se deve apagar o PDF original do celular.
+  Future<void> _askDeletePdf() async {
+    final uri = _pdfUri;
+    if (uri == null || !mounted) return;
+    final apagar = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.delete_outline),
+        title: const Text('Livro enviado!'),
+        content: Text('Quer apagar o PDF "${_title ?? ''}" do seu celular?'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Manter')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Apagar PDF')),
+        ],
+      ),
+    );
+    if (apagar != true) return;
+    bool ok = false;
+    try {
+      ok = await _share.invokeMethod<bool>('deletePdf', {'uri': uri}) ?? false;
+    } catch (_) {}
+    if (!mounted) return;
+    if (!ok) {
+      // PDF veio compartilhado por outro app: o Android só deixa apagar se o usuário escolher o arquivo
+      final escolher = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Falta um toque'),
+          content: Text('O Android pede que você toque no PDF "${_title ?? ''}" para confirmar que ele pode ser apagado.'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Deixar')),
+            FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Escolher o PDF')),
+          ],
+        ),
+      );
+      if (escolher != true) return;
+      try {
+        ok = await _share.invokeMethod<bool>('pickAndDelete') ?? false;
+      } catch (_) {}
+      if (!mounted) return;
+    }
+    if (ok) _pdfUri = null;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(ok ? 'PDF apagado do celular.' : 'O PDF não foi apagado.'),
+    ));
   }
 
   Future<void> _changeCover() async {
@@ -228,7 +266,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 ]),
               if (_stage == Stage.idle)
                 Text('Escolha um PDF ou compartilhe um PDF com este app.\n'
-                    'A capa Ã© detectada e o livro vai direto para o seu Kindle.',
+                    'A capa é detectada e o livro vai direto para o seu Kindle.',
                     textAlign: TextAlign.center, style: t.bodyMedium),
               const SizedBox(height: 16),
               if (_stage == Stage.done || _stage == Stage.error)
@@ -250,7 +288,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 }
 
-/// Miniaturas das primeiras pÃ¡ginas para escolher a capa manualmente.
+/// Miniaturas das primeiras páginas para escolher a capa manualmente.
 class CoverPickerSheet extends StatefulWidget {
   const CoverPickerSheet({super.key, required this.pdfPath, required this.current});
   final String pdfPath;
@@ -289,7 +327,7 @@ class _CoverPickerSheetState extends State<CoverPickerSheet> {
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Text('Qual pÃ¡gina Ã© a capa?', style: Theme.of(context).textTheme.titleMedium),
+          Text('Qual página é a capa?', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 12),
           SizedBox(
             height: 420,
